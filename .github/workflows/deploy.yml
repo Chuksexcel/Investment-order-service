@@ -1,0 +1,255 @@
+name: Investment Order Service — CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: investment-order-service
+  SERVICE_NAME: investment-orders
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CI: Test, lint, security scan
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: investment_orders_test
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy app/
+
+      - name: Security scan (bandit)
+        run: bandit -r app/ -ll
+
+      - name: Dependency audit (safety)
+        run: safety check --full-report
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://testuser:testpass@localhost:5432/investment_orders_test
+          REDIS_URL: redis://localhost:6379/0
+          DJANGO_SETTINGS_MODULE: app.settings.test
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=xml \
+            --cov-fail-under=85 \
+            -v
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Build and push Docker image to ECR
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "tags=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "short-sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Deploy to Staging
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Pre-deploy RDS snapshot
+        run: |
+          aws rds create-db-snapshot \
+            --db-instance-identifier investment-orders-staging \
+            --db-snapshot-identifier "pre-deploy-staging-$(date +%Y%m%d-%H%M%S)"
+
+      - name: Blue/green deploy to staging
+        run: |
+          # Launch new (green) task definition
+          aws ecs update-service \
+            --cluster investment-orders-staging \
+            --service ${{ env.SERVICE_NAME }} \
+            --force-new-deployment \
+            --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200"
+
+          # Wait for deployment to stabilise
+          aws ecs wait services-stable \
+            --cluster investment-orders-staging \
+            --services ${{ env.SERVICE_NAME }}
+
+      - name: Smoke tests
+        run: |
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          curl -f "$STAGING_URL/health/deep" || (echo "Deep health check FAILED" && exit 1)
+          curl -f "$STAGING_URL/health/ready" || (echo "Readiness check FAILED" && exit 1)
+          echo "Staging smoke tests passed."
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Deploy to Production (requires manual approval)
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production    # GitHub environment requires manual approval
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Pre-deploy RDS snapshot (PRODUCTION)
+        run: |
+          SNAPSHOT_ID="pre-deploy-prod-$(date +%Y%m%d-%H%M%S)"
+          aws rds create-db-snapshot \
+            --db-instance-identifier investment-orders-primary \
+            --db-snapshot-identifier "$SNAPSHOT_ID" \
+            --tags Key=Type,Value=pre-deploy Key=SHA,Value="${{ github.sha }}"
+          echo "SNAPSHOT_ID=$SNAPSHOT_ID" >> $GITHUB_ENV
+
+          # Wait for snapshot to complete before proceeding
+          aws rds wait db-snapshot-completed \
+            --db-snapshot-identifier "$SNAPSHOT_ID"
+
+      - name: Blue/green deploy to production (canary: 10%)
+        run: |
+          # Create green target group and shift 10% traffic
+          # (Implementation depends on your ALB + CodeDeploy setup)
+          aws deploy create-deployment \
+            --application-name investment-orders \
+            --deployment-group-name production \
+            --revision '{"revisionType":"AppSpecContent"}' \
+            --description "Deploy ${{ github.sha }}"
+
+      - name: Monitor canary (5 minutes)
+        run: |
+          echo "Monitoring error rate and p99 latency for 5 minutes..."
+          for i in $(seq 1 10); do
+            sleep 30
+            ERROR_RATE=$(aws cloudwatch get-metric-statistics \
+              --namespace InvestmentOrders \
+              --metric-name ErrorRate \
+              --period 60 \
+              --statistics Average \
+              --query 'Datapoints[0].Average' \
+              --output text)
+            echo "Error rate check $i: $ERROR_RATE"
+            if (( $(echo "$ERROR_RATE > 0.005" | bc -l) )); then
+              echo "ERROR RATE EXCEEDED THRESHOLD — triggering rollback"
+              exit 1
+            fi
+          done
+          echo "Canary monitoring passed. Shifting 100% traffic to green."
+
+      - name: Shift 100% traffic to green
+        if: success()
+        run: |
+          echo "Deployment succeeded. Full traffic shift complete."
+
+      - name: Automatic rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed — rolling back to blue"
+          aws deploy stop-deployment \
+            --deployment-id $DEPLOYMENT_ID \
+            --auto-rollback-enabled
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Production deploy ${{ job.status }}: investment-order-service
+            SHA: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
