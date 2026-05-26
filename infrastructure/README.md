@@ -1,39 +1,29 @@
-# Investment Order Service — Infrastructure
+# Infrastructure
 
-This directory contains all Terraform configurations for the investment order service.
+All Terraform configurations for the investment order service.
 
-## Directory Structure
+## Structure
 
 ```
-infrastructure/
-├── terraform/
-│   ├── compute/         # EC2, ASG, ALB
-│   ├── database/        # RDS, RDS Proxy, Read Replicas
-│   ├── cache/           # ElastiCache Redis
-│   ├── network/         # VPC, subnets, security groups, NAT
-│   ├── observability/   # CloudWatch, alarms, dashboards
-│   └── security/        # WAF, KMS keys, IAM roles
-└── README.md
+terraform/
+├── compute/        # EC2, ASG, ALB
+├── database/       # RDS, RDS Proxy, Read Replicas
+├── cache/          # ElastiCache Redis
+├── network/        # VPC, subnets, security groups, NAT
+├── observability/  # CloudWatch dashboards and alarms
+└── security/       # WAF, KMS keys, IAM roles
 ```
-
-## Prerequisites
-
-- Terraform >= 1.5
-- AWS CLI configured with appropriate credentials
-- S3 bucket for Terraform state (configure in `backend.tf`)
 
 ## Usage
 
 ```bash
 cd infrastructure/terraform
 terraform init
-terraform plan -var-file="envs/production.tfvars"
+terraform plan  -var-file="envs/production.tfvars"
 terraform apply -var-file="envs/production.tfvars"
 ```
 
-## State Management
-
-Remote state is stored in S3 with DynamoDB locking:
+## State Backend
 
 ```hcl
 terraform {
@@ -47,9 +37,5 @@ terraform {
 }
 ```
 
-## Environments
-
-- `envs/staging.tfvars` — staging environment variables
-- `envs/production.tfvars` — production environment variables
-
-**Never commit `production.tfvars` to version control.** Use CI/CD secrets.
+> Never commit `production.tfvars` — use CI/CD secrets instead.
+> Never run `terraform apply` on production without a peer-reviewed plan.
